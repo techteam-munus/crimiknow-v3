@@ -371,8 +371,11 @@ export function ChatInterface({ user, sessionId, onSessionCreated, onMessageSent
             {messages
               .filter(msg => !loadedMessages.some(loaded => loaded.id === msg.id))
               .map((message) => {
-                // Show thinking indicator for empty assistant messages while loading
-                if (message.role === 'assistant' && !message.content && isLoading) {
+                // Check if content is empty or whitespace-only (keep-alive signal)
+                const hasRealContent = message.content && message.content.trim().length > 0
+                
+                // Show thinking indicator for empty/whitespace assistant messages while loading
+                if (message.role === 'assistant' && !hasRealContent && isLoading) {
                   return (
                     <div key={message.id} className="flex items-start gap-3 py-4">
                       <div className="w-8 h-8 rounded-full bg-green-800 flex items-center justify-center shrink-0">
@@ -384,13 +387,13 @@ export function ChatInterface({ user, sessionId, onSessionCreated, onMessageSent
                           <span className="w-2 h-2 bg-green-600 rounded-full animate-bounce" style={{ animationDelay: '150ms' }}></span>
                           <span className="w-2 h-2 bg-green-600 rounded-full animate-bounce" style={{ animationDelay: '300ms' }}></span>
                         </div>
-                        <span className="text-sm text-muted-foreground">CrimiKnow is thinking...</span>
+                        <span className="text-sm text-muted-foreground">Generating response...</span>
                       </div>
                     </div>
                   )
                 }
-                // Skip empty assistant messages that are NOT loading (stale placeholders)
-                if (message.role === 'assistant' && !message.content) return null
+                // Skip empty/whitespace assistant messages that are NOT loading (stale placeholders)
+                if (message.role === 'assistant' && !hasRealContent) return null
                 // Find the preceding user message for assistant responses (for download)
                 const allMessages = [...loadedMessages, ...messages.filter(msg => !loadedMessages.some(loaded => loaded.id === msg.id))]
                 const currentIndex = allMessages.findIndex(m => m.id === message.id)

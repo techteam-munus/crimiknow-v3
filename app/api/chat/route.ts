@@ -1,5 +1,6 @@
 import { createClient } from '@/lib/supabase/server'
 import { createClient as createSupabaseClient } from '@supabase/supabase-js'
+import { streamText } from 'ai'
 
 export const maxDuration = 120 // Allow 2 minutes for AI responses (streaming)
 
@@ -693,8 +694,6 @@ export async function POST(req: Request) {
   } catch { /* use default */ }
 
   try {
-    const { streamText } = await import('ai')
-
     // Extract case names from document titles ONLY (these are the cases with actual files)
     // These will be clickable links
     const casePattern = /^.+\s+v[s]?\.?\s+.+$/i
@@ -794,21 +793,6 @@ ${retrievedDocs}
     // Use Vercel AI Gateway - works on Vercel automatically, needs AI_GATEWAY_API_KEY on AWS
     // The AI SDK uses gateway.ai.vercel.com when a model string is passed directly
     console.log('[CrimiKnow] Calling streamText with model:', activeModel)
-    
-    let result
-    try {
-      result = streamText({
-        model: activeModel,
-        system: sysPrompt,
-        messages: messagesWithCitations,
-        maxOutputTokens: 16000,
-        temperature: 0.3,
-      })
-      console.log('[CrimiKnow] streamText call successful')
-    } catch (streamError) {
-      console.error('[CrimiKnow] streamText error:', streamError)
-      throw streamError
-    }
 
     // Helper to add citation links to final content
     // Only links jurisprudence/laws that match an actual retrieved document filename
@@ -991,55 +975,83 @@ ${retrievedDocs}
       }).join('\n')
     }
 
-    // Stream the AI SDK response to the client
+    // Use Vercel AI Gateway - works on Vercel automatically, needs AI_GATEWAY_API_KEY on AWS
+    // The AI SDK uses gateway.ai.vercel.com when a model string is passed directly
+    console.log('[CrimiKnow] Calling streamText with model:', activeModel)
+
+    const result = streamText({
+      model: activeModel,
+      system: sysPrompt,
+      messages: messagesWithCitations,
+      maxOutputTokens: 16000,
+      temperature: 0.3,
+    })
+    console.log('[CrimiKnow] streamText call successful')
+
+    // Use TransformStream for proper streaming that flushes immediately on AWS Lambda
+    // This approach sends data as soon as it's available, preventing timeout
     const encoder = new TextEncoder()
     let fullContent = ''
 
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const chunk of result.textStream) {
-            fullContent += chunk
-            controller.enqueue(encoder.encode(chunk))
-          }
+    const { readable, writable } = new TransformStream()
+    const writer = writable.getWriter()
 
-          // Post-process citations
-          const processedContent = addCitationLinks(fullContent, retrievedDocNames)
-
-          // Save assistant message to DB
-          let assistantMessageId: string | null = null
-          if (sessionId) {
-            const { data: saved } = await supabaseAdmin
-              .from('chat_messages')
-              .insert({ session_id: sessionId, user_id: user.id, role: 'assistant', content: processedContent })
-              .select('id')
-              .single()
-            if (saved) assistantMessageId = saved.id
-          }
-
-          // Send metadata delimiter
-          const meta = JSON.stringify({
-            __meta: true,
-            content: processedContent,
-            sessionId,
-            userMessageId,
-            assistantMessageId,
-            provider: 'azure-search-gemini',
-            truncated: false,
-          })
-          controller.enqueue(encoder.encode(`\n\n__CRIMIKNOW_STREAM_END__\n${meta}`))
-          controller.close()
-        } catch (err) {
-          console.error('[AI SDK Stream Error]', err)
-          controller.close()
+    // Start streaming in background - don't await, let it run async
+    ;(async () => {
+      try {
+        // Send initial keep-alive signal immediately to prevent AWS Lambda timeout
+        // This establishes the connection before AI starts generating
+        await writer.write(encoder.encode(' '))
+        
+        // Iterate over the text stream and write chunks immediately
+        for await (const chunk of result.textStream) {
+          fullContent += chunk
+          await writer.write(encoder.encode(chunk))
         }
-      }
-    })
 
+        // Post-process citations
+        const processedContent = addCitationLinks(fullContent, retrievedDocNames)
+
+        // Save assistant message to DB
+        let assistantMessageId: string | null = null
+        if (sessionId) {
+          const { data: saved } = await supabaseAdmin
+            .from('chat_messages')
+            .insert({ session_id: sessionId, user_id: user.id, role: 'assistant', content: processedContent })
+            .select('id')
+            .single()
+          if (saved) assistantMessageId = saved.id
+        }
+
+        // Send metadata delimiter
+        const meta = JSON.stringify({
+          __meta: true,
+          content: processedContent,
+          sessionId,
+          userMessageId,
+          assistantMessageId,
+          provider: 'azure-search-gemini',
+          truncated: false,
+        })
+        await writer.write(encoder.encode(`\n\n__CRIMIKNOW_STREAM_END__\n${meta}`))
+        await writer.close()
+      } catch (err) {
+        console.error('[AI SDK Stream Error]', err)
+        try {
+          await writer.abort(err)
+        } catch { /* ignore abort errors */ }
+      }
+    })()
+
+    // Return the readable side immediately - this sends headers right away
+    // The TransformStream ensures proper backpressure and flushing
     return new Response(readable, {
       headers: {
         'Content-Type': 'text/plain; charset=utf-8',
         'X-AI-Provider': 'azure-search-gemini',
+        'Transfer-Encoding': 'chunked',
+        'X-Accel-Buffering': 'no',
+        'Cache-Control': 'no-cache, no-transform',
       },
     })
   } catch (error) {
